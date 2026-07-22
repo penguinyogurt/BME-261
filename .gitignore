@@ -1,0 +1,27 @@
+# Arduino / arduino-cli build output
+build/
+
+# PlatformIO
+.pio/
+*.hex
+*.elf
+*.bin
+*.map
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Local agent instructions
+CLAUDE.md
