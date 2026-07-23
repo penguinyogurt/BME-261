@@ -17,6 +17,7 @@ Close the plot window to stop; the CSV is flushed and saved on exit.
 """
 import argparse
 import csv
+import os
 import threading
 import time
 from collections import deque
@@ -40,14 +41,20 @@ def main():
     ser.reset_input_buffer()
     ser.write(b"p")             # ask firmware for the plot stream
 
-    fname = datetime.now().strftime("emg_%Y-%m-%d_%H%M%S.csv")
+    # always land in data/ next to the other captures, whatever the cwd is
+    data_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+    os.makedirs(data_dir, exist_ok=True)
+    fname = os.path.join(data_dir,
+                         datetime.now().strftime("emg_%Y-%m-%d_%H%M%S.csv"))
     csv_file = open(fname, "w", newline="")
     writer = csv.writer(csv_file)
-    writer.writerow(["host_time_s", "chA_raw", "chB_env"])
+    writer.writerow(["host_time_s", "chA_raw", "chB_env", "env", "intent"])
     print(f"logging to {fname}  (close the plot window to stop)")
 
     bufA = deque([0] * WINDOW, maxlen=WINDOW)
     bufB = deque([0] * WINDOW, maxlen=WINDOW)
+    bufI = deque([0] * WINDOW, maxlen=WINDOW)   # intent the firmware is sending
     lock = threading.Lock()
     running = {"go": True}
 
@@ -78,21 +85,26 @@ def main():
                     if "," not in line:
                         continue                  # skip self-test / status text
                     parts = line.split(",")
-                    if len(parts) != 2:
+                    # "chA,chB,env,intent"; older firmware sent just "chA,chB"
+                    if len(parts) not in (2, 4):
                         continue
                     try:
-                        samples.append((int(parts[0]), int(parts[1])))
+                        vals = [int(p) for p in parts]
                     except ValueError:
                         continue
+                    if len(vals) == 2:
+                        vals += [0, 0]
+                    samples.append(tuple(vals))
                 if samples:
                     with lock:
-                        bufA.extend(a for a, _ in samples)
-                        bufB.extend(b for _, b in samples)
+                        bufA.extend(s[0] for s in samples)
+                        bufB.extend(s[1] for s in samples)
+                        bufI.extend(s[3] for s in samples)
                     # spread receipt timestamps evenly across this chunk so the
                     # CSV keeps ~uniform dt instead of collapsing to one time
                     dt = (now - prev_t) / len(samples)
-                    for k, (a, b) in enumerate(samples):
-                        pending.append((f"{prev_t + (k + 1) * dt:.4f}", a, b))
+                    for k, (a, b, e, i) in enumerate(samples):
+                        pending.append((f"{prev_t + (k + 1) * dt:.4f}", a, b, e, i))
                     prev_t = now
             if pending and now - last_flush >= 0.1:
                 writer.writerows(pending)
@@ -105,22 +117,29 @@ def main():
 
     threading.Thread(target=reader, daemon=True).start()
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(9, 6))
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, sharex=True, figsize=(9, 8))
     ax1.set_title("ch A - raw bandpass (biased, should rest near 2048)")
     ax2.set_title("ch B - peak detector envelope")
-    ax2.set_xlabel("samples")
+    ax3.set_title("intent  (+ close / - open, 0 = hold)")
+    ax3.set_xlabel("samples")
     line1, = ax1.plot(range(WINDOW), list(bufA))
     line2, = ax2.plot(range(WINDOW), list(bufB))
+    line3, = ax3.plot(range(WINDOW), list(bufI), color="tab:orange")
     for ax in (ax1, ax2):
         ax.set_ylim(0, 4095)     # full ADC range makes clipping obvious
+    ax3.set_ylim(-1100, 1100)    # intent is bounded, so use its own scale
+    ax3.axhline(0, color="0.6", linewidth=0.8)
+    for ax in (ax1, ax2, ax3):
         ax.grid(True, alpha=0.3)
+    fig.tight_layout()
 
     def update(_):
         with lock:
-            a, b = list(bufA), list(bufB)
+            a, b, i = list(bufA), list(bufB), list(bufI)
         line1.set_ydata(a)
         line2.set_ydata(b)
-        return line1, line2
+        line3.set_ydata(i)
+        return line1, line2, line3
 
     _ani = FuncAnimation(fig, update, interval=33, blit=True,
                          cache_frame_data=False)

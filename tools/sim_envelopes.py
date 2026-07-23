@@ -49,7 +49,7 @@ def load(path):
     with open(path) as fh:
         r = csv.reader(fh); next(r, None)
         for row in r:
-            if len(row) != 3:
+            if len(row) < 3:            # newer logs carry env,intent too
                 continue
             try:
                 t.append(float(row[0])); b.append(int(row[2]))

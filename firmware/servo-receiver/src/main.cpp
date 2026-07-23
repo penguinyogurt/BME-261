@@ -44,9 +44,10 @@ const int SERVO_PIN  = 18;
 const int STOP_US    = 1500;
 const int MIN_US     = 900;
 const int MAX_US     = 2100;
-// Map intent +/-1000 to +/-SPEED_SPAN around neutral. 450 keeps it gentle
-// (1050..1950 us); raise toward 600 for the servo's full speed once tuned.
-const int SPEED_SPAN = 450;
+// Map intent +/-1000 to +/-SPEED_SPAN around neutral. 400 caps the servo at
+// 1100..1900 us - about 2/3 of its rated speed (~39 RPM at 6 V). The servo's
+// own limit is 600 (900..2100 us).
+const int SPEED_SPAN = 400;
 const int CLOSE_SIGN = +1;    // +1: positive intent -> pulses above neutral.
                               // Flip to -1 if "close" turns out to open.
 const int DEADBAND   = 20;    // |intent| below this = true stop
@@ -55,6 +56,12 @@ const int SLEW_US    = 12;    // max pulse-width change per control tick
 // ---- Link watchdog ----
 const uint32_t LINK_TIMEOUT_MS = 300;   // 15 missed 50 Hz packets
 const uint32_t CONTROL_MS      = 20;    // servo update period (50 Hz)
+
+// ---- Travel limit ----
+// Seconds to go fully open -> fully closed at FULL command (SPEED_SPAN). Only
+// scales the grip% readout - the open limit is symmetric, so it holds at any
+// value. Measure it on the real mechanism to make grip% mean something.
+const float FULL_TRAVEL_S = 1.7f;
 
 // ---- Shared state (written in ISR-like callback, read in loop) ----
 volatile int16_t  rxIntent     = 0;
@@ -66,6 +73,16 @@ volatile uint32_t lastRxMs     = 0;
 
 int   curUs        = STOP_US;   // last pulse width actually commanded
 uint32_t nextCtrlMs = 0, nextLogMs = 0, lastLogCount = 0;
+
+// Dead-reckoned grip travel: 0.0 = fully open, 1.0 = nominal full close. Only
+// the open end is enforced, so opening exactly undoes the closing we did. It may
+// read >1.0 if you close further - that is intended, so the matching open still
+// unwinds all of it.
+// ponytail: open-loop estimate, drifts with battery sag and load. Holding the
+// mechanism against a hard stop stalls the servo AND inflates this estimate.
+// Re-zero against a real reference (current-sense at the end stop, or a limit
+// switch) when that exists; assumes the hand starts OPEN at power-on.
+float gripPos = 0.0f;
 
 void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len != (int)sizeof(IntentPacket)) return;   // ignore foreign traffic
@@ -123,10 +140,22 @@ void loop() {
   if (!linkUp || !rxCalibrated) targetUs = STOP_US;   // failsafe / not ready
   else                          targetUs = intentToUs(rxIntent);
 
+  // Open limit: opening can only undo the closing we actually did, so it can
+  // never wind past full-open. Closing is deliberately unbounded - you control
+  // how far to close.
+  if (gripPos <= 0.0f && (targetUs - STOP_US) * CLOSE_SIGN < 0)
+    targetUs = STOP_US;
+
   // Slew-limit toward the target so intent jumps can't slam the mechanism.
   if      (curUs < targetUs) curUs = min(curUs + SLEW_US, targetUs);
   else if (curUs > targetUs) curUs = max(curUs - SLEW_US, targetUs);
   drive.writeMicroseconds(curUs);
+
+  // Integrate what we actually commanded (not the raw intent - slew limiting
+  // means they differ) to keep the travel estimate honest.
+  gripPos += ((curUs - STOP_US) * CLOSE_SIGN / (float)SPEED_SPAN)
+             * (CONTROL_MS / 1000.0f) / FULL_TRAVEL_S;
+  if (gripPos < 0.0f) gripPos = 0.0f;   // only the open end is bounded
 
   // Telemetry ~5 Hz so the serial monitor stays readable.
   if ((int32_t)(now - nextLogMs) >= 0) {
@@ -134,9 +163,10 @@ void loop() {
     uint32_t hz = (c - lastLogCount) * 1000 / 200;   // packets in last 200 ms
     lastLogCount = c; nextLogMs = now + 200;
     uint8_t st = rxState <= 3 ? rxState : 4;
-    Serial.printf("RX #%lu seq=%lu %luHz | intent=%d state=%s cal=%d | us=%d %s\n",
+    Serial.printf("RX #%lu seq=%lu %luHz | intent=%d state=%s cal=%d | us=%d grip=%d%% %s\n",
                   (unsigned long)c, (unsigned long)rxSeq, (unsigned long)hz,
                   (int)rxIntent, STATE_NAMES[st], rxCalibrated ? 1 : 0,
-                  curUs, linkUp ? "" : "*** LINK LOST -> NEUTRAL ***");
+                  curUs, (int)(gripPos * 100),
+                  linkUp ? "" : "*** LINK LOST -> NEUTRAL ***");
   }
 }
