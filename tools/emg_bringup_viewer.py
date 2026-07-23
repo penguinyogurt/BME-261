@@ -52,24 +52,56 @@ def main():
     running = {"go": True}
 
     def reader():
+        # Drain the whole serial buffer each pass (not one readline per sample):
+        # at 500 Hz, line-by-line reads fall behind and the OS buffer backs up,
+        # so the plot shows ever-older data. Bulk-draining keeps the reader ahead;
+        # the display deque (maxlen=WINDOW) then keeps only the newest samples, so
+        # latency can't accumulate. Every sample is still logged, in batches.
+        buf = b""
+        pending = []                 # CSV rows waiting to be flushed
+        prev_t = time.time()
+        last_flush = prev_t
         while running["go"]:
             try:
-                line = ser.readline().decode("ascii", "ignore").strip()
+                n = ser.in_waiting
+                chunk = ser.read(n if n else 1)   # all pending, or block for 1 byte
             except Exception:
                 continue
-            if "," not in line:
-                continue                     # skip self-test / status text
-            parts = line.split(",")
-            if len(parts) != 2:
-                continue
-            try:
-                a, b = int(parts[0]), int(parts[1])
-            except ValueError:
-                continue
-            with lock:
-                bufA.append(a)
-                bufB.append(b)
-            writer.writerow([f"{time.time():.4f}", a, b])
+            now = time.time()
+            if chunk:
+                buf += chunk
+                lines = buf.split(b"\n")
+                buf = lines.pop()                 # keep the incomplete remainder
+                samples = []
+                for raw in lines:
+                    line = raw.decode("ascii", "ignore").strip()
+                    if "," not in line:
+                        continue                  # skip self-test / status text
+                    parts = line.split(",")
+                    if len(parts) != 2:
+                        continue
+                    try:
+                        samples.append((int(parts[0]), int(parts[1])))
+                    except ValueError:
+                        continue
+                if samples:
+                    with lock:
+                        bufA.extend(a for a, _ in samples)
+                        bufB.extend(b for _, b in samples)
+                    # spread receipt timestamps evenly across this chunk so the
+                    # CSV keeps ~uniform dt instead of collapsing to one time
+                    dt = (now - prev_t) / len(samples)
+                    for k, (a, b) in enumerate(samples):
+                        pending.append((f"{prev_t + (k + 1) * dt:.4f}", a, b))
+                    prev_t = now
+            if pending and now - last_flush >= 0.1:
+                writer.writerows(pending)
+                csv_file.flush()
+                pending.clear()
+                last_flush = now
+        if pending:                              # final flush on shutdown
+            writer.writerows(pending)
+            csv_file.flush()
 
     threading.Thread(target=reader, daemon=True).start()
 

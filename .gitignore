@@ -3,6 +3,9 @@ build/
 
 # PlatformIO
 .pio/
+
+# Generated plots / analysis artifacts — regenerate with tools/*.py
+output/
 *.hex
 *.elf
 *.bin
