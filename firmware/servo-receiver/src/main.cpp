@@ -51,9 +51,9 @@ const int SPEED_SPAN = 400;
 // Closing drives 1.5x faster than opening: a grip should feel immediate, while
 // opening stays gentle. 400 * 1.5 = 600 us is exactly the servo's rated limit
 // (900..2100), so this is the most it can take without clipping.
-// SPEED_SPAN remains the REFERENCE span that FULL_TRAVEL_S and the gripPos
-// integrator are expressed in, so a boosted close correctly advances gripPos
-// 1.5x faster — it really is covering travel 1.5x faster.
+// SPEED_SPAN remains the REFERENCE span the gripDrive integrator is expressed
+// in, so a boosted close correctly advances gripDrive 1.5x faster — it really
+// is covering travel 1.5x faster.
 // MUST MATCH CLOSE_BOOST in firmware/emg-collector: the sender mirrors this
 // math to decide when to stop OPENING, and if the two disagree the hand stops
 // short of fully open.
@@ -81,10 +81,35 @@ uint8_t  cmdLen = 0;
 bool     cmdBad = false;      // current line overflowed -> ignore it entirely
 
 // ---- Travel limit ----
-// Seconds to go fully open -> fully closed at FULL command (SPEED_SPAN). Only
-// scales the grip% readout - the open limit is symmetric, so it holds at any
-// value. Measure it on the real mechanism to make grip% mean something.
-const float FULL_TRAVEL_S = 1.7f;
+// gripDrive is measured in SECONDS OF FULL-SPEED-EQUIVALENT DRIVE, not as a
+// normalised 0..1 fraction. Driving at half speed for 2 s counts the same as
+// full speed for 1 s, and an open simply has to give back what a close put in.
+// Normalising by a "full travel" constant used to sit in this integrator, but
+// it is a constant divisor that cancels out of the unwind completely — it only
+// ever scaled the grip% readout, while making the units hard to reason about.
+//
+// TRAVEL_CLAMP_S is the ONE physical constant that matters: how many seconds of
+// full-speed drive the mechanism absorbs going fully open -> fully closed. It
+// exists because of STALL — once the hand is against its end stop the servo is
+// still commanded but no longer moves, and counting that phantom drive would
+// make the matching open take absurdly long unwinding motion that never
+// happened. Without the clamp the unwind is exact but unbounded; with it set
+// too LOW the estimate stops counting travel the hand is still making, and a
+// close can no longer be fully undone.
+//
+// MEASURED on the real mechanism: driving CLOSE at full manual speed takes 24 s
+// to reach the closed stop. Closing runs at cmdFrac 1.5 (CLOSE_BOOST), so that
+// is 24 * 1.5 = 36 drive-units of full travel.
+//
+// The old value here was 1.955 — a guess, and 18x too small. That is what made
+// the hand creep shut: a 2 s grip adds 12% of travel, the estimate stopped
+// counting long before, and the matching open gave back only a fraction.
+//
+// MUST MATCH the sender's TRAVEL_CLAMP_S. Re-measure if the mechanism, the
+// gearing or the servo supply voltage changes.
+const float TRAVEL_CLAMP_S   = 36.0f;   // drive-units for full open -> closed
+const float TRAVEL_NOMINAL_S = 36.0f;   // grip% readout scaling (same value, so
+                                        // 100% really means fully closed)
 
 // ---- Shared state (written in ISR-like callback, read in loop) ----
 volatile int16_t  rxIntent     = 0;
@@ -97,18 +122,15 @@ volatile uint32_t lastRxMs     = 0;
 int   curUs        = STOP_US;   // last pulse width actually commanded
 uint32_t nextCtrlMs = 0, nextLogMs = 0, lastLogCount = 0;
 
-// Dead-reckoned grip travel: 0.0 = fully open, 1.0 = nominal full close.
-// BOTH ends are now bounded. The open end so opening cannot wind past full
-// open; the closed end because the hand physically cannot close past its end
-// stop — an 8 s hard flex used to integrate to 4.5x full travel, and the
-// matching open then needed 25 s to unwind motion that never happened (the
-// servo was stalled against the stop). GRIP_MAX MUST MATCH the sender's.
+// Net closing drive commanded so far, in seconds of full-speed equivalent.
+// 0 = fully open. Bounded at both ends: at 0 so an open cannot wind past full
+// open, and at TRAVEL_CLAMP_S because the hand cannot close past its end stop
+// (see the measured value above).
 // ponytail: open-loop estimate, drifts with battery sag and load. Holding the
 // mechanism against a hard stop stalls the servo AND inflates this estimate.
 // Re-zero against a real reference (current-sense at the end stop, or a limit
 // switch) when that exists; assumes the hand starts OPEN at power-on.
-const float GRIP_MAX = 1.15f;   // slack over 1.0 for FULL_TRAVEL_S error
-float gripPos = 0.0f;
+float gripDrive = 0.0f;
 
 void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len != (int)sizeof(IntentPacket)) return;   // ignore foreign traffic
@@ -200,11 +222,11 @@ void loop() {
   // Open limit: opening can only undo the closing we actually did, so it can
   // never wind past full-open. Closing is deliberately unbounded - you control
   // how far to close.
-  // MANUAL BYPASSES THIS ON PURPOSE. gripPos is dead-reckoned and can drift; if
+  // MANUAL BYPASSES THIS ON PURPOSE. gripDrive is dead-reckoned and can drift; if
   // it reads 0 while the hand is actually still closed, the clamp would refuse
   // to open and there would be no way back. Manual is the recovery path, so it
   // must be able to drive open regardless. The slew limit still applies.
-  if (!manual && gripPos <= 0.0f && (targetUs - STOP_US) * CLOSE_SIGN < 0)
+  if (!manual && gripDrive <= 0.0f && (targetUs - STOP_US) * CLOSE_SIGN < 0)
     targetUs = STOP_US;
 
   // Slew-limit toward the target so intent jumps can't slam the mechanism.
@@ -214,10 +236,10 @@ void loop() {
 
   // Integrate what we actually commanded (not the raw intent - slew limiting
   // means they differ) to keep the travel estimate honest.
-  gripPos += ((curUs - STOP_US) * CLOSE_SIGN / (float)SPEED_SPAN)
-             * (CONTROL_MS / 1000.0f) / FULL_TRAVEL_S;
-  if (gripPos < 0.0f)     gripPos = 0.0f;
-  if (gripPos > GRIP_MAX) gripPos = GRIP_MAX;   // cannot close past the end stop
+  gripDrive += ((curUs - STOP_US) * CLOSE_SIGN / (float)SPEED_SPAN)
+               * (CONTROL_MS / 1000.0f);
+  if (gripDrive < 0.0f)            gripDrive = 0.0f;
+  if (gripDrive > TRAVEL_CLAMP_S)  gripDrive = TRAVEL_CLAMP_S;  // at the end stop
 
   // Telemetry ~5 Hz so the serial monitor stays readable.
   if ((int32_t)(now - nextLogMs) >= 0) {
@@ -229,7 +251,7 @@ void loop() {
                   (unsigned long)c, (unsigned long)rxSeq, (unsigned long)hz,
                   manual ? (int)manualIntent : (int)rxIntent,
                   manual ? "MANUAL" : STATE_NAMES[st], rxCalibrated ? 1 : 0,
-                  curUs, (int)(gripPos * 100),
+                  curUs, (int)(gripDrive / TRAVEL_NOMINAL_S * 100),
                   manual ? "[manual override] " : "",
                   (linkUp || manual) ? "" : "*** LINK LOST -> NEUTRAL ***");
   }

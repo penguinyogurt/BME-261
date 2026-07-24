@@ -5,21 +5,19 @@
  * that intent to the servo board (7C:87:CE:30:FA:88) at 50 Hz. The servo board
  * owns all safety (travel clamp, watchdog, stall stop) - we only send intent.
  *
- * THRESHOLDING
- * chB's resting floor was measured moving only 83 counts over 95 s, and chB is
- * already a peak-detector envelope. So there is no adaptive baseline and no
- * rest/MVC trial: tare the floor ONCE, then use two fixed thresholds above it
- * with hysteresis. Nothing tracks the signal during use, so a grip can be held
- * for any length of time without being chased.
+ * DETECTION
+ * Activity is the RATIO of a fast envelope of chB to a slow one (dualrate).
+ * Being dimensionless it needs NO tare and NO calibration: the resting floor
+ * may drift and the thresholds drift with it. See the constants below.
  *
- *   floor  = 10th percentile of a 200-sample tare   (boot, or 't')
- *   T_ON   = floor + ON_OFF    -> start closing; speed scales up to FULL_OFF
- *   T_OFF  = floor + OFF_OFF   -> release to HOLDING (hysteresis gap)
+ *   activity = fastEMA / slowEMA
+ *   T_ON_R   -> start closing; grip force scales up to T_FULL_R
+ *   T_OFF_R  -> release to HOLDING (hysteresis gap)
  *
  * Serial commands (single character):
  *   p : plot stream  -> "chA,chB,activity,intent" per sample
  *   i : intent stream-> "activity,intent" at 50 Hz
- *   t : re-tare the floor + bias / clipping / ground checks
+ *   t : self-test — bias / clipping / ground checks (no tare; none is needed)
  *   ca / cb : pick which channel drives intent (A=raw bipolar, B=envelope)
  *
  * Wiring:
@@ -31,7 +29,8 @@
  * WARNING: never feed more than 3.3 V into a GPIO. Confirm with a multimeter
  * that both outputs stay within 0 - 3.3 V before wiring.
  *
- * Thresholds validated over the captures in data/ by tools/sim_simple.py.
+ * Detection validated over the captures in data/ by tools/score_intent.py,
+ * against the offline answer key in data/answer_key/.
  */
 
 #include <Arduino.h>
@@ -80,7 +79,11 @@ const uint32_t TICK_MS       = 1000 / (SAMPLE_HZ / TICK_DIV);
 const uint32_t DEBOUNCE_MS   = 80;     // sustained flex needed to enter CLOSING
 const uint32_t RELAX_MS      = 150;    // sustained relax in CLOSING -> latch
 const uint32_t OPEN_DWELL_MS = 2000;   // full relax this long -> hand opens
-const int      OPEN_SPEED    = 600;    // intent magnitude while opening
+// Opening drives at the full SPEED_SPAN. At 600 it was only 240 us against
+// closing's boosted 600 us — 2.5x slower — so with 36 units of real travel a
+// full open took 40 s and got truncated. At 1000 the ratio is exactly
+// CLOSE_BOOST: closing stays 1.5x quicker than opening, as intended.
+const int      OPEN_SPEED    = 1000;   // intent magnitude while opening
 const int      CLOSE_MIN     = 250;    // weakest close intent once engaged
 
 // Opening used to run for a FIXED OPEN_DRIVE_MS (2500 ms). Closing has no time
@@ -90,7 +93,7 @@ const int      CLOSE_MIN     = 250;    // weakest close intent once engaged
 //
 // So the open is now driven by TRAVEL, not time. gripEst mirrors the receiver's
 // dead-reckoned gripPos using the same formula, and OPENING continues until it
-// unwinds to zero. FULL_TRAVEL_S MUST MATCH the receiver's FULL_TRAVEL_S.
+// unwinds to zero. TRAVEL_CLAMP_S MUST MATCH the receiver's TRAVEL_CLAMP_S.
 // The mirror must also model the receiver's SLEW LIMIT. Reversing from full
 // close to full open takes ~53 ticks to ramp through neutral, and the hand
 // keeps closing for part of that. Integrating raw intent instead ran the
@@ -98,7 +101,18 @@ const int      CLOSE_MIN     = 250;    // weakest close intent once engaged
 // ponytail: open-loop mirror of an open-loop estimate. Replace both with a real
 // reference (limit switch / current sense) when one exists. Assumes the hand
 // starts OPEN at power-on.
-const float    FULL_TRAVEL_S   = 1.7f;  // open->closed at full command
+// gripEst counts SECONDS OF FULL-SPEED-EQUIVALENT DRIVE, so an open just gives
+// back what a close put in — no normalising constant, because dividing by one
+// cancels out of the unwind entirely and only ever scaled a percentage readout.
+// TRAVEL_CLAMP_S is the seconds of full-speed drive the mechanism absorbs
+// open->closed; it exists solely to stop STALL (drive commanded while against
+// the end stop, which moves nothing) from inflating the estimate.
+// MEASURED: driving CLOSE at full manual speed takes 24 s to reach the closed
+// stop, and closing runs at cmdFrac 1.5, so full travel = 24 * 1.5 = 36 units.
+// The old 1.955 was a guess and 18x too small — the estimate stopped counting
+// almost immediately, so an open could never give back what a close put in.
+// MUST MATCH the receiver's TRAVEL_CLAMP_S.
+const float    TRAVEL_CLAMP_S  = 36.0f;  // drive-units for full open -> closed
 const float    SERVO_SLEW_TICK = 0.03f; // = SLEW_US/SPEED_SPAN on the receiver
 const int      SERVO_DEADBAND  = 20;    // MUST MATCH the receiver's DEADBAND
 const float    CLOSE_BOOST     = 1.5f;  // MUST MATCH the receiver's CLOSE_BOOST.
@@ -109,13 +123,12 @@ const float    CLOSE_BOOST     = 1.5f;  // MUST MATCH the receiver's CLOSE_BOOST
                                         // ST_OPENING would quit early, leaving the
                                         // hand part-closed — the exact bug the
                                         // travel-based open was written to fix.
-// The hand cannot close past its end stop, so the estimate must not either.
-// Without this an 8 s hard flex integrates to 4.5x full travel and the unwind
-// needs 25 s - the servo was stalled against the stop for most of it, moving
-// nothing. Capped, a full open is always ~3.4 s. MUST MATCH the receiver.
-const float    GRIP_MAX        = 1.15f; // slack over 1.0 for FULL_TRAVEL_S error
-const uint32_t OPEN_MAX_MS     = 8000;  // safety cap if the estimate runs away
-float          gripEst         = 0.0f;  // 0.0 = open, 1.0 = nominal full close
+// Sized from the measurement, not guessed: unwinding a full 36 units at
+// OPEN_SPEED 1000 takes 37 s, so 30 s would have left 7 units (~19% of travel)
+// permanently closed. A backstop that should never fire in normal use - a
+// typical 2 s grip unwinds in about 4 s.
+const uint32_t OPEN_MAX_MS     = 45000; // hard backstop on a runaway open
+float          gripEst         = 0.0f;  // seconds of net closing drive; 0 = open
 float          cmdFrac         = 0.0f;  // slew-limited speed the servo is at
 
 enum IntentState : uint8_t { ST_OPEN = 0, ST_CLOSING, ST_HOLDING, ST_OPENING };
@@ -336,9 +349,9 @@ void intentTick(int raw) {
   if      (cmdFrac < want) cmdFrac = min(cmdFrac + SERVO_SLEW_TICK, want);
   else if (cmdFrac > want) cmdFrac = max(cmdFrac - SERVO_SLEW_TICK, want);
   if (gripEst <= 0.0f && cmdFrac < 0.0f) cmdFrac = 0.0f;   // receiver's open clamp
-  gripEst += cmdFrac * (TICK_MS / 1000.0f) / FULL_TRAVEL_S;
-  if (gripEst < 0.0f)     gripEst = 0.0f;
-  if (gripEst > GRIP_MAX) gripEst = GRIP_MAX;   // cannot close past the end stop
+  gripEst += cmdFrac * (TICK_MS / 1000.0f);
+  if (gripEst < 0.0f)           gripEst = 0.0f;
+  if (gripEst > TRAVEL_CLAMP_S) gripEst = TRAVEL_CLAMP_S;   // at the end stop
 
   lastIntent = intent;
   IntentPacket p = {++txSeq, (int16_t)intent, (uint8_t)ist, (uint8_t)alive};
