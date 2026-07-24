@@ -48,6 +48,16 @@ const int MAX_US     = 2100;
 // 1100..1900 us - about 2/3 of its rated speed (~39 RPM at 6 V). The servo's
 // own limit is 600 (900..2100 us).
 const int SPEED_SPAN = 400;
+// Closing drives 1.5x faster than opening: a grip should feel immediate, while
+// opening stays gentle. 400 * 1.5 = 600 us is exactly the servo's rated limit
+// (900..2100), so this is the most it can take without clipping.
+// SPEED_SPAN remains the REFERENCE span that FULL_TRAVEL_S and the gripPos
+// integrator are expressed in, so a boosted close correctly advances gripPos
+// 1.5x faster — it really is covering travel 1.5x faster.
+// MUST MATCH CLOSE_BOOST in firmware/emg-collector: the sender mirrors this
+// math to decide when to stop OPENING, and if the two disagree the hand stops
+// short of fully open.
+const float CLOSE_BOOST = 1.5f;
 const int CLOSE_SIGN = +1;    // +1: positive intent -> pulses above neutral.
                               // Flip to -1 if "close" turns out to open.
 const int DEADBAND   = 20;    // |intent| below this = true stop
@@ -114,7 +124,10 @@ void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
 
 int intentToUs(int intent) {
   if (abs(intent) < DEADBAND) return STOP_US;
-  int off = (int)((long)intent * SPEED_SPAN / 1000) * CLOSE_SIGN;
+  // intent > 0 is CLOSING (see the packet doc at the top), independent of
+  // CLOSE_SIGN, which only decides which way that maps onto pulse width.
+  long span = (intent > 0) ? (long)(SPEED_SPAN * CLOSE_BOOST) : SPEED_SPAN;
+  int off = (int)((long)intent * span / 1000) * CLOSE_SIGN;
   return constrain(STOP_US + off, MIN_US, MAX_US);
 }
 

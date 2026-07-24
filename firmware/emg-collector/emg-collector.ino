@@ -101,6 +101,14 @@ const int      CLOSE_MIN     = 250;    // weakest close intent once engaged
 const float    FULL_TRAVEL_S   = 1.7f;  // open->closed at full command
 const float    SERVO_SLEW_TICK = 0.03f; // = SLEW_US/SPEED_SPAN on the receiver
 const int      SERVO_DEADBAND  = 20;    // MUST MATCH the receiver's DEADBAND
+const float    CLOSE_BOOST     = 1.5f;  // MUST MATCH the receiver's CLOSE_BOOST.
+                                        // Closing drives 1.5x faster than opening,
+                                        // so it covers travel 1.5x faster too. If
+                                        // this mirror omitted the boost, gripEst
+                                        // would under-count what was closed and
+                                        // ST_OPENING would quit early, leaving the
+                                        // hand part-closed — the exact bug the
+                                        // travel-based open was written to fix.
 // The hand cannot close past its end stop, so the estimate must not either.
 // Without this an 8 s hard flex integrates to 4.5x full travel and the unwind
 // needs 25 s - the servo was stalled against the stop for most of it, moving
@@ -122,8 +130,8 @@ typedef struct __attribute__((packed)) {
 
 char        mode = 'p';
 uint32_t    nextSampleUs = 0;
-int         srcPin  = PIN_RAW;          // channel driving intent
-char        srcName = 'a';
+int         srcPin  = PIN_ENV;          // channel driving intent — chB by default:
+char        srcName = 'b';              // dualrate was tuned and validated on chB
 float       sig = 1.0f;                 // activity = fast/slow ratio, 1.0 = rest
 float       envFast = 0.0f, envSlow = 0.0f;   // the two envelopes
 bool        envValid = false;           // envelopes seeded on a live sample
@@ -235,10 +243,17 @@ void selfTest() {
   resetDetector();
   ist = ST_OPEN; aboveOnMs = belowOffMs = 0;
   gripEst = 0.0f; cmdFrac = 0.0f;
-  ready = (meanB > DEAD_ABS) || (srcPin == PIN_RAW);
+  // dualrate self-calibrates, so there is nothing to wait for: the board is
+  // always "ready". Whether the front end is actually LIVE is judged per sample
+  // by `raw > DEAD_ABS` in intentTick(), so intent starts the instant a signal
+  // appears and stops during a brown-out — no reboot, no 't', no re-tare.
+  // Latching this from a one-shot boot measurement of meanB was a trap: a board
+  // powered on before its analog front end silently produced zero intent
+  // forever, which is why the viewer's intent trace stayed flat.
+  ready = true;
   Serial.printf("  ch %c dual-rate ratio: T_on=%.3f T_off=%.3f full=%.3f%s\n\n",
                 srcName - 32, T_ON_R, T_OFF_R, T_FULL_R,
-                ready ? "" : "   (front-end looks unpowered)");
+                meanB > DEAD_ABS ? "" : "   (front-end reads ~0 now; will engage when live)");
 }
 
 void setSource(char ch) {
@@ -317,6 +332,7 @@ void intentTick(int raw) {
   // speed actually reached. Only the open end is bounded - closing further is
   // deliberate, and the matching open must be able to unwind all of it.
   float want = (abs(intent) < SERVO_DEADBAND) ? 0.0f : intent / 1000.0f;
+  if (want > 0.0f) want *= CLOSE_BOOST;      // closing is the faster direction
   if      (cmdFrac < want) cmdFrac = min(cmdFrac + SERVO_SLEW_TICK, want);
   else if (cmdFrac > want) cmdFrac = max(cmdFrac - SERVO_SLEW_TICK, want);
   if (gripEst <= 0.0f && cmdFrac < 0.0f) cmdFrac = 0.0f;   // receiver's open clamp
