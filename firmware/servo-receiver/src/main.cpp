@@ -57,6 +57,19 @@ const int SLEW_US    = 12;    // max pulse-width change per control tick
 const uint32_t LINK_TIMEOUT_MS = 300;   // 15 missed 50 Hz packets
 const uint32_t CONTROL_MS      = 20;    // servo update period (50 Hz)
 
+// ---- Manual override (tools/motor_debug.py over USB serial) ----
+// Command: "m<intent>\n", intent -1000..1000, e.g. "m600" / "m-600" / "m0".
+// DEADMAN: every command only buys MANUAL_HOLD_MS of authority. The web page
+// re-sends while a button is held, so a closed tab, a crashed browser, or an
+// unplugged cable all stop the motor within 400 ms on their own. Manual never
+// needs an explicit "release" to be safe — silence IS the safe state.
+const uint32_t MANUAL_HOLD_MS = 400;
+int16_t  manualIntent  = 0;
+uint32_t manualUntilMs = 0;
+char     cmdBuf[16];
+uint8_t  cmdLen = 0;
+bool     cmdBad = false;      // current line overflowed -> ignore it entirely
+
 // ---- Travel limit ----
 // Seconds to go fully open -> fully closed at FULL command (SPEED_SPAN). Only
 // scales the grip% readout - the open limit is symmetric, so it holds at any
@@ -74,14 +87,17 @@ volatile uint32_t lastRxMs     = 0;
 int   curUs        = STOP_US;   // last pulse width actually commanded
 uint32_t nextCtrlMs = 0, nextLogMs = 0, lastLogCount = 0;
 
-// Dead-reckoned grip travel: 0.0 = fully open, 1.0 = nominal full close. Only
-// the open end is enforced, so opening exactly undoes the closing we did. It may
-// read >1.0 if you close further - that is intended, so the matching open still
-// unwinds all of it.
+// Dead-reckoned grip travel: 0.0 = fully open, 1.0 = nominal full close.
+// BOTH ends are now bounded. The open end so opening cannot wind past full
+// open; the closed end because the hand physically cannot close past its end
+// stop — an 8 s hard flex used to integrate to 4.5x full travel, and the
+// matching open then needed 25 s to unwind motion that never happened (the
+// servo was stalled against the stop). GRIP_MAX MUST MATCH the sender's.
 // ponytail: open-loop estimate, drifts with battery sag and load. Holding the
 // mechanism against a hard stop stalls the servo AND inflates this estimate.
 // Re-zero against a real reference (current-sense at the end stop, or a limit
 // switch) when that exists; assumes the hand starts OPEN at power-on.
+const float GRIP_MAX = 1.15f;   // slack over 1.0 for FULL_TRAVEL_S error
 float gripPos = 0.0f;
 
 void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
@@ -100,6 +116,30 @@ int intentToUs(int intent) {
   if (abs(intent) < DEADBAND) return STOP_US;
   int off = (int)((long)intent * SPEED_SPAN / 1000) * CLOSE_SIGN;
   return constrain(STOP_US + off, MIN_US, MAX_US);
+}
+
+// Parse "m<intent>\n" from USB serial. Anything else is ignored, so stray
+// characters from a serial monitor cannot move the motor.
+void pollSerial() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (!cmdBad && cmdLen >= 2 && cmdBuf[0] == 'm') {
+        cmdBuf[cmdLen] = '\0';
+        manualIntent  = constrain(atoi(cmdBuf + 1), -1000, 1000);
+        manualUntilMs = millis() + MANUAL_HOLD_MS;
+      }
+      cmdLen = 0; cmdBad = false;
+    } else if (cmdBad) {
+      // discard the REST of a poisoned line. Resetting cmdLen instead would let
+      // a long garbage line resync mid-stream: "xxxxxxxxxxxxxxxm600\n" would
+      // overflow, restart the buffer at 'm', and drive the motor.
+    } else if (cmdLen < sizeof(cmdBuf) - 1) {
+      cmdBuf[cmdLen++] = c;
+    } else {
+      cmdBad = true;          // overlong: ignore everything up to the newline
+    }
+  }
 }
 
 void setup() {
@@ -129,21 +169,29 @@ void setup() {
 }
 
 void loop() {
+  pollSerial();
+
   uint32_t now = millis();
   if ((int32_t)(now - nextCtrlMs) < 0) return;
   nextCtrlMs = now + CONTROL_MS;
 
   bool linkUp = (rxCount > 0) && (now - lastRxMs <= LINK_TIMEOUT_MS);
+  bool manual = (int32_t)(now - manualUntilMs) < 0;
 
   // Decide target pulse width, safest-first.
   int targetUs;
-  if (!linkUp || !rxCalibrated) targetUs = STOP_US;   // failsafe / not ready
-  else                          targetUs = intentToUs(rxIntent);
+  if (manual)                        targetUs = intentToUs(manualIntent);
+  else if (!linkUp || !rxCalibrated) targetUs = STOP_US;   // failsafe / not ready
+  else                               targetUs = intentToUs(rxIntent);
 
   // Open limit: opening can only undo the closing we actually did, so it can
   // never wind past full-open. Closing is deliberately unbounded - you control
   // how far to close.
-  if (gripPos <= 0.0f && (targetUs - STOP_US) * CLOSE_SIGN < 0)
+  // MANUAL BYPASSES THIS ON PURPOSE. gripPos is dead-reckoned and can drift; if
+  // it reads 0 while the hand is actually still closed, the clamp would refuse
+  // to open and there would be no way back. Manual is the recovery path, so it
+  // must be able to drive open regardless. The slew limit still applies.
+  if (!manual && gripPos <= 0.0f && (targetUs - STOP_US) * CLOSE_SIGN < 0)
     targetUs = STOP_US;
 
   // Slew-limit toward the target so intent jumps can't slam the mechanism.
@@ -155,7 +203,8 @@ void loop() {
   // means they differ) to keep the travel estimate honest.
   gripPos += ((curUs - STOP_US) * CLOSE_SIGN / (float)SPEED_SPAN)
              * (CONTROL_MS / 1000.0f) / FULL_TRAVEL_S;
-  if (gripPos < 0.0f) gripPos = 0.0f;   // only the open end is bounded
+  if (gripPos < 0.0f)     gripPos = 0.0f;
+  if (gripPos > GRIP_MAX) gripPos = GRIP_MAX;   // cannot close past the end stop
 
   // Telemetry ~5 Hz so the serial monitor stays readable.
   if ((int32_t)(now - nextLogMs) >= 0) {
@@ -163,10 +212,12 @@ void loop() {
     uint32_t hz = (c - lastLogCount) * 1000 / 200;   // packets in last 200 ms
     lastLogCount = c; nextLogMs = now + 200;
     uint8_t st = rxState <= 3 ? rxState : 4;
-    Serial.printf("RX #%lu seq=%lu %luHz | intent=%d state=%s cal=%d | us=%d grip=%d%% %s\n",
+    Serial.printf("RX #%lu seq=%lu %luHz | intent=%d state=%s cal=%d | us=%d grip=%d%% %s%s\n",
                   (unsigned long)c, (unsigned long)rxSeq, (unsigned long)hz,
-                  (int)rxIntent, STATE_NAMES[st], rxCalibrated ? 1 : 0,
+                  manual ? (int)manualIntent : (int)rxIntent,
+                  manual ? "MANUAL" : STATE_NAMES[st], rxCalibrated ? 1 : 0,
                   curUs, (int)(gripPos * 100),
-                  linkUp ? "" : "*** LINK LOST -> NEUTRAL ***");
+                  manual ? "[manual override] " : "",
+                  (linkUp || manual) ? "" : "*** LINK LOST -> NEUTRAL ***");
   }
 }
